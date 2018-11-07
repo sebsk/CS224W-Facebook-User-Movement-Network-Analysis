@@ -58,6 +58,83 @@ def fill_unknown_regions(df, which, threshold=5): # which could fill in "Startin
                     df[which + ' Region Name'].iloc[i] = copy(df[which + ' Region Name'].iloc[i+1])
                     df[which + ' Location'].iloc[i] = copy(df[which + ' Location'].iloc[i+1])
 
+# Fill NAs and adjust inconsistency in the original datasets.
+def data_cleansing(df):
+    # Fill NA in People Moving
+    idx = pd.isnull(df['Baseline: People Moving'])
+    df['Baseline: People Moving'][idx] = 100 * df[idx]['Difference']/df[idx]['Percent Change']
+    idx = pd.isnull(df['Crisis: People Moving'])
+    df['Crisis: People Moving'][idx] = df[idx]['Difference'] + df[idx]['Baseline: People Moving']
+
+    # Fill NA in Differene and Percent Change.
+    idx = pd.isnull(df['Difference'])
+    df['Difference'][idx] = df['Crisis: People Moving'][idx] - df['Baseline: People Moving'][idx]
+    idx = pd.isnull(df['Percent Change'])
+    df['Percent Change'][idx] = df['Difference'][idx] / df['Baseline: People Moving'][idx] *100
+
+    # Find the median of the known z-score/baseline ratio, which is used for filling NAs in z score later on.
+    df_z_calc = df[(pd.isnull(df['Standard (Z) Score'])==False) & (df['Crisis: People Moving'] - df['Baseline: People Moving']==df['Difference']) & (df['Standard (Z) Score']!=0) &(df['Baseline: People Moving']>0)]
+    df_z_calc['sd over baseline'] = df_z_calc['Difference'] / df_z_calc['Standard (Z) Score'] / df_z_calc['Baseline: People Moving']
+    sd_over_baseline = df_z_calc['sd over baseline'].median()
+
+    # Tackle inconsisitency in People Moving and adjust z score based on new People Moving
+    df['Baseline: People Moving'] = df['Crisis: People Moving'] - df['Difference']
+    idx = (pd.isnull(df['Standard (Z) Score'])|idx)&(df['Baseline: People Moving']!=0)
+    df['Standard (Z) Score'][idx] = df['Difference'][idx]/(sd_over_baseline * df['Baseline: People Moving'][idx])
+
+    # Fill unknown reagions lacking name and/or locaiton code is -1 with nearest neighbor
+    fill_unknown_regions(df, 'Starting')
+    fill_unknown_regions(df, 'Ending')
+
+    # Fill unknown regions with OpenCage map.
+    locations = {}
+    for i in df[(df['Starting Region Name']=='__') | (df['Ending Region Name']=='__')].index:
+        if df['Starting Region Name'].loc[i] == '__':
+            geo_info = geocoder.opencage([df['Starting location lat'].loc[i], df['Starting location lon'].loc[i]], method='reverse', key='8793bad49e134015a1010a75f0bb4a52').json
+            try:
+                df['Starting Region Name'].loc[i] = geo_info['city'] + '_' + geo_info['county'] + '_' + geo_info['state']
+            except KeyError:
+                continue
+            if df['Starting Region Name'].loc[i] in locations.keys():
+                df['Starting Location'].loc[i] = locations.get(df['Starting Region Name'].loc[i])
+            else:
+                df['Starting Location'].loc[i] = max(df['Starting Location'].max(), df['Ending Location'].max()) + 1
+                locations.update({df['Starting Region Name'].loc[i]: df['Starting Location'].loc[i]})
+                
+        if df['Ending Region Name'].loc[i] == '__':
+            geo_info = geocoder.opencage([df['Ending location lat'].loc[i], df['Ending location lon'].loc[i]], method='reverse', key='8793bad49e134015a1010a75f0bb4a52').json
+            try:
+                df['Ending Region Name'].loc[i] = geo_info['city'] + '_' + geo_info['county'] + '_' + geo_info['state']
+            except KeyError:
+                continue
+            if df['Ending Region Name'].loc[i] in locations.keys():
+                df['Ending Location'].loc[i] = locations.get(df['Ending Region Name'].loc[i])
+            else:
+                df['Ending Location'].loc[i] = max(df['Starting Location'].max(), df['Ending Location'].max()) + 1
+                locations.update({df['Ending Region Name'].loc[i]: df['Ending Location'].loc[i]})
+
+    # drop duplicates (in terms of starting location and ending location) by keeping only the record with highest 'Crisis: People Moving'
+    df.sort_values(by=['Crisis: People Moving'], ascending=False, inplace=True)
+    df.drop_duplicates(subset=['Starting Region Name', 'Ending Region Name'], inplace=True)
+    df = df[(df['Starting Region Name']!='__')&(df['Ending Region Name']!='__')]
+
+    # replace location code -1 with unique numbers.
+    df_start = df[['Starting Location', 'Starting Region Name']].rename(columns={'Starting Location': 'location', 'Starting Region Name': 'region name'})
+    df_end = df[['Ending Location', 'Ending Region Name']].rename(columns={'Ending Location': 'location', 'Ending Region Name': 'region name'})
+    df_regions = pd.concat([df_start, df_end]).drop_duplicates()
+    to_be_assigned = df_regions[df_regions['location']==-1]['region name']
+    for region in to_be_assigned:
+        df_regions['location'][df_regions['region name']==region] = df_regions['location'].max() + 1
+    df_minus_1 = df[(df['Starting Location']==-1)|(df['Ending Location']==-1)]
+    df = df[(df['Starting Location']!=-1)&(df['Ending Location']!=-1)]
+    df_minus_1 = df_minus_1.merge(df_regions, how='left', left_on='Starting Region Name', right_on='region name')
+    df_minus_1['Starting Location'] = copy(df_minus_1['location'])
+    df_minus_1.drop(columns=['location', 'region name'], inplace=True)
+    df_minus_1 = df_minus_1.merge(df_regions, how='left', left_on='Ending Region Name', right_on='region name')
+    df_minus_1['Ending Location'] = copy(df_minus_1['location'])
+    df_minus_1.drop(columns=['location', 'region name'], inplace=True)
+    df = df.append(df_minus_1)
+
 # Create edgelist for later graph creation.
 def create_edgelist(df, when): # choose 'baseline' or 'crisis' as 'when' argument
     if when.lower()=='baseline':
@@ -153,83 +230,6 @@ def calc_params(df, when='crisis', edgelist=None, reverse=False): # 'edgelist' o
     df_pr = df_pr.merge(df_regions, how='left', on='region name')
     return df_pr
 
-# Fill NAs and adjust inconsistency in the original datasets.
-def data_cleansing(df):
-    # Fill NA in People Moving
-    idx = pd.isnull(df['Baseline: People Moving'])
-    df['Baseline: People Moving'][idx] = 100 * df[idx]['Difference']/df[idx]['Percent Change']
-    idx = pd.isnull(df['Crisis: People Moving'])
-    df['Crisis: People Moving'][idx] = df[idx]['Difference'] + df[idx]['Baseline: People Moving']
-
-    # Fill NA in Differene and Percent Change.
-    idx = pd.isnull(df['Difference'])
-    df['Difference'][idx] = df['Crisis: People Moving'][idx] - df['Baseline: People Moving'][idx]
-    idx = pd.isnull(df['Percent Change'])
-    df['Percent Change'][idx] = df['Difference'][idx] / df['Baseline: People Moving'][idx] *100
-
-    # Find the median of the known z-score/baseline ratio, which is used for filling NAs in z score later on.
-    df_z_calc = df[(pd.isnull(df['Standard (Z) Score'])==False) & (df['Crisis: People Moving'] - df['Baseline: People Moving']==df['Difference']) & (df['Standard (Z) Score']!=0) &(df['Baseline: People Moving']>0)]
-    df_z_calc['sd over baseline'] = df_z_calc['Difference'] / df_z_calc['Standard (Z) Score'] / df_z_calc['Baseline: People Moving']
-    sd_over_baseline = df_z_calc['sd over baseline'].median()
-
-    # Tackle inconsisitency in People Moving and adjust z score based on new People Moving
-    df['Baseline: People Moving'] = df['Crisis: People Moving'] - df['Difference']
-    idx = (pd.isnull(df['Standard (Z) Score'])|idx)&(df['Baseline: People Moving']!=0)
-    df['Standard (Z) Score'][idx] = df['Difference'][idx]/(sd_over_baseline * df['Baseline: People Moving'][idx])
-
-    # Fill unknown reagions lacking name and/or locaiton code is -1 with nearest neighbor
-    fill_unknown_regions(df, 'Starting')
-    fill_unknown_regions(df, 'Ending')
-
-    # Fill unknown regions with OpenCage map.
-    locations = {}
-    for i in df[(df['Starting Region Name']=='__') | (df['Ending Region Name']=='__')].index:
-        if df['Starting Region Name'].loc[i] == '__':
-            geo_info = geocoder.opencage([df['Starting location lat'].loc[i], df['Starting location lon'].loc[i]], method='reverse', key='8793bad49e134015a1010a75f0bb4a52').json
-            try:
-                df['Starting Region Name'].loc[i] = geo_info['city'] + '_' + geo_info['county'] + '_' + geo_info['state']
-            except KeyError:
-                continue
-            if df['Starting Region Name'].loc[i] in locations.keys():
-                df['Starting Location'].loc[i] = locations.get(df['Starting Region Name'].loc[i])
-            else:
-                df['Starting Location'].loc[i] = max(df['Starting Location'].max(), df['Ending Location'].max()) + 1
-                locations.update({df['Starting Region Name'].loc[i]: df['Starting Location'].loc[i]})
-                
-        if df['Ending Region Name'].loc[i] == '__':
-            geo_info = geocoder.opencage([df['Ending location lat'].loc[i], df['Ending location lon'].loc[i]], method='reverse', key='8793bad49e134015a1010a75f0bb4a52').json
-            try:
-                df['Ending Region Name'].loc[i] = geo_info['city'] + '_' + geo_info['county'] + '_' + geo_info['state']
-            except KeyError:
-                continue
-            if df['Ending Region Name'].loc[i] in locations.keys():
-                df['Ending Location'].loc[i] = locations.get(df['Ending Region Name'].loc[i])
-            else:
-                df['Ending Location'].loc[i] = max(df['Starting Location'].max(), df['Ending Location'].max()) + 1
-                locations.update({df['Ending Region Name'].loc[i]: df['Ending Location'].loc[i]})
-
-    # drop duplicates (in terms of starting location and ending location) by keeping only the record with highest 'Crisis: People Moving'
-    df.sort_values(by=['Crisis: People Moving'], ascending=False, inplace=True)
-    df.drop_duplicates(subset=['Starting Region Name', 'Ending Region Name'], inplace=True)
-
-    # replace location code -1 with unique numbers.
-    df = df[(df['Starting Region Name']!='__')&(df['Ending Region Name']!='__')]
-    df_start = df[['Starting Location', 'Starting Region Name']].rename(columns={'Starting Location': 'location', 'Starting Region Name': 'region name'})
-    df_end = df[['Ending Location', 'Ending Region Name']].rename(columns={'Ending Location': 'location', 'Ending Region Name': 'region name'})
-    df_regions = pd.concat([df_start, df_end]).drop_duplicates()
-    to_be_assigned = df_regions[df_regions['location']==-1]['region name']
-    for region in to_be_assigned:
-        df_regions['location'][df_regions['region name']==region] = df_regions['location'].max() + 1
-    df_minus_1 = df[(df['Starting Location']==-1)|(df['Ending Location']==-1)]
-    df = df[(df['Starting Location']!=-1)&(df['Ending Location']!=-1)]
-    df_minus_1 = df_minus_1.merge(df_regions, how='left', left_on='Starting Region Name', right_on='region name')
-    df_minus_1['Starting Location'] = copy(df_minus_1['location'])
-    df_minus_1.drop(columns=['location', 'region name'], inplace=True)
-    df_minus_1 = df_minus_1.merge(df_regions, how='left', left_on='Ending Region Name', right_on='region name')
-    df_minus_1['Ending Location'] = copy(df_minus_1['location'])
-    df_minus_1.drop(columns=['location', 'region name'], inplace=True)
-    df = df.append(df_minus_1)
-
 # draw degree distribution
 def draw_deg_dist(edgelist):
     G = nx.DiGraph()
@@ -304,6 +304,19 @@ def draw_deg_count(edgelist):
     print 'in degree: slope={}, intercept={}.'.format(p_in[0], p_in[1])
     print 'out degree: slope={}, intercept={}.'.format(p_out[0], p_out[1])
 
+# detect communities using igraph's label propagation method. The community is attached to the df, which contains 'region name'
+def community_detection(df, edgelist):
+    G_no_self = create_graph(edgelist, self_edges=False)
+    communities = G_no_self.community_label_propagation(weights='weight')
+    sgs = communities.subgraphs()
+    clust = [-1]*df.shape[0]
+    for k in range(df.shape[0]):
+        for i in range(len(sgs)):
+            if df['region name'].iloc[k] in sgs[i].vs['name']:
+                clust[k] = i
+                break
+    df['community'] = clust
+    
 # draw communities using folium
 def draw_communities(df_regions, threshold=10, popup=True): # df_regions contains 'lon', 'lat', 'region name', 'community'.
     df_community_size = df_regions['community'].value_counts().reset_index()
